@@ -1018,16 +1018,30 @@ class MishGLU(MyModule):
 ########################################################################################################
 import copy
 
-def _set_attr(module, attr_path, param):
+def _set_attr(module, attr_path, shared_param):
     """
-    Helper to set a parameter in a module given a dotted attribute path.
-    For example, attr_path="att.key.weight" => module.att.key.weight = param
+    Helper to set a parameter in a module given a dotted attribute path
+    so that it does *not* register as a new parameter in PyTorch.
+
+    For example:
+      attr_path="att.key.weight" => module.att.key.weight = shared_param
     """
     attrs = attr_path.split('.')
     submodule = module
     for attr in attrs[:-1]:
         submodule = getattr(submodule, attr)
-    submodule._parameters[attrs[-1]] = param
+
+    param_name = attrs[-1]
+
+    # Remove from the submodule's parameter registry
+    # so that it doesn't show up as a separate parameter.
+    if param_name in submodule._parameters:
+        del submodule._parameters[param_name]
+
+    # Attach 'shared_param' as a normal attribute instead.
+    # This keeps the same underlying tensor/grad connectivity,
+    # but PyTorch won't treat it as a param of this submodule.
+    setattr(submodule, param_name, shared_param)
 
 def tie_module_params(src_module, tgt_module):
     """
@@ -1051,10 +1065,11 @@ class TiedModuleStack(nn.Module):
       module (nn.Module): The base module whose weights are to be shared.
       count (int): The number of times to replicate the module.
     """
-    def __init__(self, module: nn.Module, count: int):
+    def __init__(self, module: nn.Module, count: int, args: dict):
         super().__init__()
         self.count = count
         self.module_stack = nn.ModuleList()
+        self.args = args
 
         # Add the original module as the first instance.
         self.module_stack.append(module)
@@ -1065,13 +1080,21 @@ class TiedModuleStack(nn.Module):
             tie_module_params(module, new_module)
             self.module_stack.append(new_module)
 
-    def forward(self, x):
-        # Pass the input through each module in sequence.
+
+    def _forward_all(self, x):
+        # Apply all modules in sequence with adjustable number of input/output params.
         for mod in self.module_stack:
             x = mod(x)
-            
         return x
-
+    
+    def forward(self, x):
+        if self.args.grad_cp == 1:
+            # Checkpoint the entire chain as one block.
+            x = deepspeed.checkpointing.checkpoint(self._forward_all, x)
+        else:
+            x = self._forward_all(x)
+        return x
+    
 class TiedModuleStackVFirst(TiedModuleStack):
     """
     Creates a stack of modules whose weights are tied, but each copy is
@@ -1081,10 +1104,19 @@ class TiedModuleStackVFirst(TiedModuleStack):
         module (nn.Module): The base module whose weights are to be shared.
         count (int): The number of times to replicate the module.
     """
-    def forward(self, x, v_first):
-        # Pass the input through each module in sequence.
+    def _forward_all(self, x, v_first):
+        # Apply all modules in sequence with adjustable number of input/output params.
         for mod in self.module_stack:
             x, v_first = mod(x, v_first)
+        return x, v_first
+    
+    def forward(self, x, v_first):
+        if self.args.grad_cp == 1:
+            # Checkpoint the entire chain as one block.
+            x, v_first = deepspeed.checkpointing.checkpoint(self._forward_all, x, v_first)
+        else:
+            x, v_first = self._forward_all(x, v_first)
+            
         return x, v_first
 
 class Block(nn.Module):
@@ -1147,8 +1179,9 @@ class Block(nn.Module):
         if '-reasoning' in os.environ["RWKV_MY_TESTING"] and \
             str(layer_id) in os.environ["REASONING_LAYERS"].split(','):
                 reasoning_iters = int(os.environ["REASONING_ITERS"])
-                self.ffn = TiedModuleStack(self.ffn, reasoning_iters)
-                self.att = TiedModuleStackVFirst(self.att, reasoning_iters)
+                self.ffn = TiedModuleStack(self.ffn, reasoning_iters, args)
+                if os.environ.get("REASONING_FFN_ONLY", "0") == "0":
+                    self.att = TiedModuleStackVFirst(self.att, reasoning_iters, args)
 
     if 'x070' in os.environ["RWKV_MY_TESTING"]:
         def forward(self, x, v_first):
@@ -1250,6 +1283,8 @@ class RWKV(pl.LightningModule):
         lr_1x = set()
         lr_2x = set()
         lr_3x = set()
+        
+        lr_modulestack = set()
         for n, p in self.named_parameters():
 
             # if not p.requires_grad:
@@ -1257,7 +1292,10 @@ class RWKV(pl.LightningModule):
             if args.train_type == 'states':
                 if 'time_sta' not in n:
                     continue
-
+                
+            if "module_stack" in n:
+                lr_modulestack.add(n)
+                
             if (("_w1" in n) or ("_w2" in n)) and (args.layerwise_lr > 0):
                 lr_1x.add(n)
             elif (("time_sta" in n) and (args.weight_decay > 0)):
@@ -1294,24 +1332,36 @@ class RWKV(pl.LightningModule):
             print('1x', lr_1x, '\n')
             print('2x', lr_2x, '\n')
             print('3x', lr_3x, '\n')
+            print('modulestack', lr_modulestack, '\n')
 
         param_dict = {n: p for n, p in self.named_parameters()}
+        
+        reasoning_iters = int(os.environ["REASONING_ITERS"])
         
         if args.layerwise_lr > 0:
             if args.my_pile_stage == 2:
                 optim_groups = [
-                    {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                    {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 2e-3 / args.lr_init},
-                    {"params": [param_dict[n] for n in lr_3x], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 3e-3 / args.lr_init},
+                    {"params": [param_dict[n] for n in lr_1x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                    {"params": [param_dict[n] for n in lr_2x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 2e-3 / args.lr_init},
+                    {"params": [param_dict[n] for n in lr_3x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 3e-3 / args.lr_init},
+                    {"params": [param_dict[n] for n in lr_1x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_2x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_3x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0 / reasoning_iters},
                 ]
             else:
                 optim_groups = [
-                    {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                    {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
-                    {"params": [param_dict[n] for n in lr_3x], "weight_decay": 0.0, "my_lr_scale": 3.0},
+                    {"params": [param_dict[n] for n in lr_1x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                    {"params": [param_dict[n] for n in lr_2x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 2.0},
+                    {"params": [param_dict[n] for n in lr_3x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 3.0},
+                    {"params": [param_dict[n] for n in lr_1x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_2x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 2.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_3x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 3.0 / reasoning_iters},
                 ]
         else:
-            optim_groups = [{"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0}]
+            optim_groups = [
+                {"params": [param_dict[n] for n in lr_1x not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                {"params": [param_dict[n] for n in lr_1x in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters}
+            ]
 
         if args.weight_decay > 0:
             optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
@@ -1455,6 +1505,10 @@ class RWKV(pl.LightningModule):
                 # It's one of the blocks we want to rename
                 # For example, if it has "att." but no "module_stack"
                 if "att." in k and "module_stack." not in k:
+                    if os.environ.get("REASONING_FFN_ONLY", "0") == "1":
+                        # Skip att params if we're only reasoning on FFN
+                        fixed_dict[k] = v
+                        continue
                     # rename from ".att." -> ".att.module_stack.0."
                     new_k = k.replace(".att.", ".att.module_stack.0.")
                     # put original param into new name

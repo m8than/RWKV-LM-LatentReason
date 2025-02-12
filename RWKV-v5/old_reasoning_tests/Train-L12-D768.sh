@@ -22,8 +22,8 @@ PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #######################################################################################################################
 #
 M_BSZ="16" # for 80G VRAM GPUs
-LR_INIT="4e-4"
-LR_FINAL="4e-4"
+LR_INIT="5e-4"
+LR_FINAL="5e-4"
 #
 W_DECAY="0.1"
 BETA_2="0.99"
@@ -42,7 +42,7 @@ DS_BUCKET_MB=200 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affec
 export RWKV_JIT_ON=0
 # export REASONING_LAYERS="4,5,6,7"
 # export REASONING_ITERS=5
-python train.py --load_model "" --wandb "RWKV-7-Latent-Reasoning-Test-New" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
+python train.py --load_model "" --wandb "RWKV-7-Latent-Reasoning-Test" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --my_pile_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "data/ContextExtend64KRWKV/dataset_chunk_0_text_document" --my_exit_tokens 6520020899 --magic_prime 1591787 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD --pre_ffn 0 --head_qk 0 \
