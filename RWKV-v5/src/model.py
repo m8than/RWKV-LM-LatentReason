@@ -44,8 +44,14 @@ HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE_A"])
 if 'x070' in os.environ["RWKV_MY_TESTING"]:
     CHUNK_LEN = 16
 
-    flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
-    load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+    flags = [f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "-O3"]
+    if torch.cuda.is_available():
+        if torch.version.hip:
+            flags += ["--save-temps"]
+        else:
+            flags += ["-res-usage", "--use_fast_math", "-Xptxas -O3", "--extra-device-vectorization"]
+    #flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
+    load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op_cpp.cu'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
 
     class WindBackstepping(torch.autograd.Function):
         @staticmethod
@@ -822,9 +828,10 @@ class RWKV_Tmix_x070(MyModule):
 
             # D_MV_LORA = 32
             D_MV_LORA = max(32, int(round(  (1.3*(C**0.5))  /32)*32)) # suggestion
-            self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
-            self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
-            self.v0 = nn.Parameter(torch.zeros(1,1,C)+1.0)
+            if layer_id != 0:
+                self.v1 = nn.Parameter(torch.zeros(C, D_MV_LORA))
+                self.v2 = nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1))
+                self.v0 = nn.Parameter(torch.zeros(1,1,C)+1.0)
 
             # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
             # D_GATE_LORA = 128
@@ -1009,7 +1016,76 @@ class MishGLU(MyModule):
 ########################################################################################################
 # The RWKV Model with our blocks
 ########################################################################################################
+import copy
 
+def _set_attr(module, attr_path, param):
+    """
+    Helper to set a parameter in a module given a dotted attribute path.
+    For example, attr_path="att.key.weight" => module.att.key.weight = param
+    """
+    attrs = attr_path.split('.')
+    submodule = module
+    for attr in attrs[:-1]:
+        submodule = getattr(submodule, attr)
+    submodule._parameters[attrs[-1]] = param
+
+def tie_module_params(src_module, tgt_module):
+    """
+    Tie the parameters of tgt_module to those of src_module.
+    This function assumes that src_module and tgt_module have been constructed
+    similarly (so parameter names match).
+    """
+    src_params = dict(src_module.named_parameters())
+    tgt_params = dict(tgt_module.named_parameters())
+    for name, src_param in src_params.items():
+        if name in tgt_params:
+            # Point the target parameter at the *same* data.
+            _set_attr(tgt_module, name, src_param)
+
+class TiedModuleStack(nn.Module):
+    """
+    Creates a stack of modules whose weights are tied, but each copy is
+    physically present as a submodule (necessary for DeepSpeed).
+    
+    Parameters:
+      module (nn.Module): The base module whose weights are to be shared.
+      count (int): The number of times to replicate the module.
+    """
+    def __init__(self, module: nn.Module, count: int):
+        super().__init__()
+        self.count = count
+        self.module_stack = nn.ModuleList()
+
+        # Add the original module as the first instance.
+        self.module_stack.append(module)
+
+        # Create additional copies and tie their weights to those of the original.
+        for _ in range(1, count):
+            new_module = copy.deepcopy(module)
+            tie_module_params(module, new_module)
+            self.module_stack.append(new_module)
+
+    def forward(self, x):
+        # Pass the input through each module in sequence.
+        for mod in self.module_stack:
+            x = mod(x)
+            
+        return x
+
+class TiedModuleStackVFirst(TiedModuleStack):
+    """
+    Creates a stack of modules whose weights are tied, but each copy is
+    physically present as a submodule (necessary for DeepSpeed).
+    
+    Parameters:
+        module (nn.Module): The base module whose weights are to be shared.
+        count (int): The number of times to replicate the module.
+    """
+    def forward(self, x, v_first):
+        # Pass the input through each module in sequence.
+        for mod in self.module_stack:
+            x, v_first = mod(x, v_first)
+        return x, v_first
 
 class Block(nn.Module):
     def __init__(self, args, layer_id):
@@ -1066,6 +1142,13 @@ class Block(nn.Module):
         if args.dropout > 0:
             self.drop0 = nn.Dropout(p = args.dropout)
             self.drop1 = nn.Dropout(p = args.dropout)
+            
+        
+        if '-reasoning' in os.environ["RWKV_MY_TESTING"] and \
+            str(layer_id) in os.environ["REASONING_LAYERS"].split(','):
+                reasoning_iters = int(os.environ["REASONING_ITERS"])
+                self.ffn = TiedModuleStack(self.ffn, reasoning_iters)
+                self.att = TiedModuleStackVFirst(self.att, reasoning_iters)
 
     if 'x070' in os.environ["RWKV_MY_TESTING"]:
         def forward(self, x, v_first):
@@ -1347,7 +1430,106 @@ class RWKV(pl.LightningModule):
             all = self.all_gather(batch_parts)
             if self.trainer.is_global_zero:
                 self.trainer.my_loss_all = all
+ 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        1) If '-reasoning' in RWKV_MY_TESTING, rename the specified "reasoning layers"
+           from single-copy names (e.g. blocks.4.att.x_r) to multi-copy names 
+           (blocks.4.att.module_stack.0.x_r, etc.).
+        2) Keep all other keys unmodified.
+        3) Pass the full dictionary to super().load_state_dict(...).
+        """
+        # If no '-reasoning' in RWKV_MY_TESTING, just load normally
+        if '-reasoning' not in os.environ.get("RWKV_MY_TESTING", ""):
+            return super().load_state_dict(state_dict, strict=strict)
+        
+        # Otherwise, we do the partial rename
+        reasoning_layers = os.environ["REASONING_LAYERS"].split(',')  # e.g. "4,5"
+        r_iters = int(os.environ["REASONING_ITERS"])  # e.g. 5
 
+        fixed_dict = {}
+        for k, v in state_dict.items():
+
+            # Check if this key belongs to a "reasoning" block
+            if "blocks." in k and any(f".{layer}." in k for layer in reasoning_layers):
+                # It's one of the blocks we want to rename
+                # For example, if it has "att." but no "module_stack"
+                if "att." in k and "module_stack." not in k:
+                    # rename from ".att." -> ".att.module_stack.0."
+                    new_k = k.replace(".att.", ".att.module_stack.0.")
+                    # put original param into new name
+                    fixed_dict[new_k] = v
+
+                    # Also replicate for iteration 1..(r_iters-1)
+                    # e.g. .att.module_stack.1., .att.module_stack.2., etc.
+                    for i in range(1, r_iters):
+                        iteration_k = new_k.replace(".0.", f".{i}.")
+                        fixed_dict[iteration_k] = v
+
+                elif "ffn." in k and "module_stack." not in k:
+                    # rename from ".ffn." -> ".ffn.module_stack.0."
+                    new_k = k.replace(".ffn.", ".ffn.module_stack.0.")
+                    fixed_dict[new_k] = v
+                    # replicate
+                    for i in range(1, r_iters):
+                        iteration_k = new_k.replace(".0.", f".{i}.")
+                        fixed_dict[iteration_k] = v
+
+                else:
+                    # It's a reasoning layer but not an att/ffn param or already has module_stack
+                    # => just store unmodified
+                    fixed_dict[k] = v
+
+            else:
+                # Not a reasoning layer => keep original name
+                fixed_dict[k] = v
+
+        # Now load
+        return super().load_state_dict(fixed_dict, strict=strict)
+
+    def state_dict(self, *args, **kwargs):
+        """
+        Override to *convert back* from multi-copy naming to single-copy naming 
+        so your saved checkpoint is compatible with older code.
+
+        e.g. keys like blocks.4.att.module_stack.0.x_r -> blocks.4.att.x_r
+             (and we might skip blocks.4.att.module_stack.1.x_r, etc. 
+              or fold them all back into one.)
+        """
+        orig_sd = super().state_dict(*args, **kwargs)
+        if '-reasoning' not in os.environ.get("RWKV_MY_TESTING", ""):
+            # If no reasoning mode, just return as-is
+            return orig_sd
+
+        # Otherwise do the "collapse" back to single-layer naming
+        collapsed_sd = {}
+        for k, v in orig_sd.items():
+            # example: "blocks.4.att.module_stack.0.x_r"
+            if ".module_stack." in k:
+                # remove ".module_stack.0" to convert back
+                # caution: only do it if .0. is present 
+                # (ignore .1. .2. etc. if you only want to keep the "first" copy)
+                # For example:
+                #   blocks.4.att.module_stack.0.x_r -> blocks.4.att.x_r
+                #   blocks.4.ffn.module_stack.0.key.weight -> blocks.4.ffn.key.weight
+
+                # If you want to keep only the "0" copy, detect that:
+                parts = k.split(".module_stack.")
+                left = parts[0]  # e.g. "blocks.4.att"
+                right = parts[1] # e.g. "0.x_r" or "1.x_r"
+                
+                # parse the iteration index
+                iteration_idx, remainder = right.split('.', 1)
+                if iteration_idx == "0":
+                    new_k = f"{left}.{remainder}"  # e.g. "blocks.4.att.x_r"
+                    collapsed_sd[new_k] = v
+                # If iteration_idx != "0", skip or store differently if you want
+            else:
+                # keep original
+                collapsed_sd[k] = v
+
+        return collapsed_sd
+    
     def generate_init_weight(self):
         print(
             f"""

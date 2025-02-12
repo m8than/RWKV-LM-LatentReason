@@ -10,7 +10,9 @@ if __name__ == "__main__":
     from pytorch_lightning import Trainer
     from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
     import pytorch_lightning as pl
+    import torch
 
+    torch.set_float32_matmul_precision('medium')
     rank_zero_info("########## work in progress ##########")
 
     parser = ArgumentParser()
@@ -132,7 +134,7 @@ if __name__ == "__main__":
         args.run_name = f"v{args.my_img_version}-{args.my_img_size}-{args.my_img_bit}bit-{args.my_img_clip}x{args.my_img_clip_scale}"
         args.proj_dir = f"{args.proj_dir}-{args.run_name}"
     else:
-        args.run_name = f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
+        args.run_name = f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd} {args.my_testing}"
     if not os.path.exists(args.proj_dir):
         os.makedirs(args.proj_dir)
 
@@ -224,7 +226,7 @@ if __name__ == "__main__":
     if args.precision == "fp16":
         rank_zero_info("\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
 
-    os.environ["RWKV_JIT_ON"] = "1"
+    #os.environ["RWKV_JIT_ON"] = "1"
     if "deepspeed_stage_3" in args.strategy:
         os.environ["RWKV_JIT_ON"] = "0"
 
@@ -319,6 +321,7 @@ if __name__ == "__main__":
 
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
     data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
+    train_data.global_rank = trainer.global_rank
 
     # if args.train_type == 'states':
     #     model.requires_grad_(False)
