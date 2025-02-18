@@ -12,4 +12,6 @@ Pass x_embed to the tied weights module, each feature in the embedding should co
 Need to test upgrading models next
 
 If we need to scale the reasoning up, it might be worth scaling to tied weights on whole groups of blocks (instead of repeating FFN/ATT repeat a GROUP of blocks), these blocks can be actually tiny blocks instead of the massive ones we use.
-NEED TO GRADIENT CP
+- NEED TO GRADIENT CP
+
+Test the normal model sizes, take the best theory and create a small ass model

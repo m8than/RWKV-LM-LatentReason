@@ -21,7 +21,7 @@ PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
 #######################################################################################################################
 #
-M_BSZ="16" # for 80G VRAM GPUs
+M_BSZ="8" # for 80G VRAM GPUs
 LR_INIT="4e-4"
 LR_FINAL="4e-4"
 #

@@ -11,17 +11,17 @@
 #
 
 
-MODEL_TYPE="x070" # x070 => rwkv-7.0
+MODEL_TYPE="x070-reasoning-weird-tiny" # x070 => rwkv-7.0
 #
-N_LAYER="12"
-N_EMBD="768"
+N_LAYER="4"
+N_EMBD="1024"
 #
 CTX_LEN="4096" # !!! change magic_prime if you change ctx_len !!!
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
 #######################################################################################################################
 #
-M_BSZ="8" # for 80G VRAM GPUs
+M_BSZ="4" # for 80G VRAM GPUs
 LR_INIT="4e-4"
 LR_FINAL="4e-4"
 #
@@ -37,11 +37,11 @@ EPOCH_SAVE=1 # save every 50 "miniepochs" (1 miniepoch = 40320 * ctx_len tokens)
 N_NODE=1 # number of nodes
 GPU_PER_NODE=8 # number of GPUs per node
 #
-DS_BUCKET_MB=200 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affects speed & vram usage)
+DS_BUCKET_MB=50 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affects speed & vram usage)
 #
 export RWKV_JIT_ON=0
-# export REASONING_LAYERS="4,5,6,7"
-# export REASONING_ITERS=5
+export REASONING_LAYERS="1,2"
+export REASONING_ITERS=30
 python train.py --load_model "" --wandb "RWKV-7-Latent-Reasoning-Test-New" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --my_pile_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "data/ContextExtend64KRWKV/dataset_chunk_0_text_document" --my_exit_tokens 6520020899 --magic_prime 1591787 \

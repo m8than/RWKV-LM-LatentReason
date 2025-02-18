@@ -1336,31 +1336,31 @@ class RWKV(pl.LightningModule):
 
         param_dict = {n: p for n, p in self.named_parameters()}
         
-        reasoning_iters = int(os.environ["REASONING_ITERS"])
+        reasoning_iters = int(os.environ.get("REASONING_ITERS", "1"))
         
         if args.layerwise_lr > 0:
             if args.my_pile_stage == 2:
                 optim_groups = [
-                    {"params": [param_dict[n] for n in lr_1x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                    {"params": [param_dict[n] for n in lr_2x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 2e-3 / args.lr_init},
-                    {"params": [param_dict[n] for n in lr_3x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 3e-3 / args.lr_init},
-                    {"params": [param_dict[n] for n in lr_1x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters},
-                    {"params": [param_dict[n] for n in lr_2x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0 / reasoning_iters},
-                    {"params": [param_dict[n] for n in lr_3x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_1x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                    {"params": [param_dict[n] for n in lr_2x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 2e-3 / args.lr_init},
+                    {"params": [param_dict[n] for n in lr_3x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0},# test: 3e-3 / args.lr_init},
+                    {"params": [param_dict[n] for n in lr_1x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_2x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_3x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 5.0 / reasoning_iters},
                 ]
             else:
                 optim_groups = [
-                    {"params": [param_dict[n] for n in lr_1x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                    {"params": [param_dict[n] for n in lr_2x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 2.0},
-                    {"params": [param_dict[n] for n in lr_3x if name not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 3.0},
-                    {"params": [param_dict[n] for n in lr_1x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters},
-                    {"params": [param_dict[n] for n in lr_2x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 2.0 / reasoning_iters},
-                    {"params": [param_dict[n] for n in lr_3x if name in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 3.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_1x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                    {"params": [param_dict[n] for n in lr_2x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 2.0},
+                    {"params": [param_dict[n] for n in lr_3x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 3.0},
+                    {"params": [param_dict[n] for n in lr_1x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_2x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 2.0 / reasoning_iters},
+                    {"params": [param_dict[n] for n in lr_3x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 3.0 / reasoning_iters},
                 ]
         else:
             optim_groups = [
-                {"params": [param_dict[n] for n in lr_1x not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
-                {"params": [param_dict[n] for n in lr_1x in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters}
+                {"params": [param_dict[n] for n in lr_1x if n not in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                {"params": [param_dict[n] for n in lr_1x if n in lr_modulestack], "weight_decay": 0.0, "my_lr_scale": 1.0 / reasoning_iters}
             ]
 
         if args.weight_decay > 0:

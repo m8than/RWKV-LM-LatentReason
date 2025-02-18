@@ -11,7 +11,7 @@
 #
 
 
-MODEL_TYPE="x070" # x070 => rwkv-7.0
+MODEL_TYPE="x070-reasoning-all" # x070 => rwkv-7.0
 #
 N_LAYER="12"
 N_EMBD="768"
@@ -40,8 +40,9 @@ GPU_PER_NODE=8 # number of GPUs per node
 DS_BUCKET_MB=200 # set to 2 for consumer GPUs, set to 200 for A100 / H100 (affects speed & vram usage)
 #
 export RWKV_JIT_ON=0
-# export REASONING_LAYERS="4,5,6,7"
-# export REASONING_ITERS=5
+export REASONING_LAYERS="1,2,3,4,5,6,7,8,9,10"
+# Highest number is the last to run, or bottom of the thingy, shouldn't reason first or last
+export REASONING_ITERS=2
 python train.py --load_model "" --wandb "RWKV-7-Latent-Reasoning-Test-New" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --my_pile_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "data/ContextExtend64KRWKV/dataset_chunk_0_text_document" --my_exit_tokens 6520020899 --magic_prime 1591787 \
